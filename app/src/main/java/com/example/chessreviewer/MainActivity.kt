@@ -15,20 +15,11 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
-import rikka.shizuku.Shizuku
 import java.util.Locale
 
 class MainActivity : Activity() {
     private val reqCapture = 100
-    private val reqShizuku = 200
     private var engine: StockfishEngine? = null
-    private lateinit var shizuku: ShizukuCapture
-    private var shizukuOut: TextView? = null
-
-    private val permissionListener =
-        Shizuku.OnRequestPermissionResultListener { requestCode, _ ->
-            if (requestCode == reqShizuku) refreshShizuku()
-        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -39,13 +30,6 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
 
-        shizuku = ShizukuCapture(applicationContext)
-        try {
-            Shizuku.addRequestPermissionResultListener(permissionListener)
-        } catch (e: Throwable) {
-            // Shizuku's service is not up; the buttons below report that.
-        }
-
         val info = TextView(this)
         info.textSize = 16f
         info.text = "Automatic mode:\n\n" +
@@ -54,13 +38,9 @@ class MainActivity : Activity() {
             "3. Open your chess game so the whole board is visible. A small panel floats at the bottom.\n" +
             "4. With the pieces in the START position, tap 'Learn' (once per piece set).\n" +
             "5. Play. The board is found automatically and the best move updates by itself.\n\n" +
-            "Flip = swap which side is at the bottom. Turn = swap whose turn it is. " +
+            "Level = engine strength (Max, then Elo levels down to 1320, then Skill 12 / 8 / 4 / 0 of 20; weaker levels sometimes pick weaker moves). Flip = swap which side is at the bottom. Turn = swap whose turn it is. " +
             "Save = writes a picture of what the app sees to Pictures/ChessReviewer (for debugging).\n\n" +
-            "Screens that block capture (FLAG_SECURE) come back black to a normal screen recording. " +
-            "The app reads those anyway when it can: through root if the phone is rooted, or through " +
-            "Shizuku if it is not. For Shizuku, install Shizuku, start it over wireless debugging " +
-            "(Android 11 and newer), then tap 'Grant Shizuku access' here. Protected screens are " +
-            "readable that way on Android 12 and newer; on older versions only root can read them."
+            "Some screens block screen capture (they show up black). For those, use the box below."
 
         val overlayBtn = Button(this)
         overlayBtn.text = "Allow overlay"
@@ -84,46 +64,6 @@ class MainActivity : Activity() {
         stopBtn.text = "Stop"
         stopBtn.setOnClickListener { stopService(Intent(this, CaptureService::class.java)) }
 
-        // ---------------------------------------------------------------- protected screens
-
-        val shizukuLabel = TextView(this)
-        shizukuLabel.textSize = 16f
-        shizukuLabel.text = "\nProtected screens (FLAG_SECURE):"
-
-        val shizukuOut = TextView(this)
-        shizukuOut.textSize = 14f
-        this.shizukuOut = shizukuOut
-
-        val grantBtn = Button(this)
-        grantBtn.text = "Grant Shizuku access"
-        grantBtn.setOnClickListener { requestShizukuPermission() }
-
-        val openBtn = Button(this)
-        openBtn.text = "Open Shizuku"
-        openBtn.setOnClickListener { openShizuku() }
-
-        val checkBtn = Button(this)
-        checkBtn.text = "Check screen access"
-        checkBtn.setOnClickListener {
-            shizukuOut.text = "Checking root, then Shizuku…"
-            Thread {
-                val secure = SecureCapture(this, cacheDir)
-                val dm = resources.displayMetrics
-                val shot = secure.grab(dm.widthPixels, dm.heightPixels)
-                val message = if (shot == null) {
-                    "Can't read protected screens: " + secure.lastError +
-                        ".\n" + secure.describe() +
-                        "\nThey will stay black; type the position in below instead."
-                } else {
-                    val size = shot.width.toString() + "x" + shot.height
-                    shot.recycle()
-                    "Works (" + secure.describe() + ") read the screen at " + size +
-                        ". Protected screens are readable while the app is running."
-                }
-                runOnUiThread { shizukuOut.text = message }
-            }.start()
-        }
-
         val posLabel = TextView(this)
         posLabel.textSize = 16f
         posLabel.text = "\nAnalyze a position by hand:"
@@ -131,6 +71,15 @@ class MainActivity : Activity() {
         val posInput = EditText(this)
         posInput.hint = "Paste a FEN, or UCI moves from the start, e.g.  e2e4 e7e5 g1f3"
         posInput.minLines = 2
+
+        val prefs = getSharedPreferences("chess", MODE_PRIVATE)
+        val levelBtn = Button(this)
+        levelBtn.text = "Engine strength: " + Levels.label(prefs.getInt("elo", 0)) + "  (tap to change)"
+        levelBtn.setOnClickListener {
+            val next = Levels.next(prefs.getInt("elo", 0))
+            prefs.edit().putInt("elo", next).apply()
+            levelBtn.text = "Engine strength: " + Levels.label(next) + "  (tap to change)"
+        }
 
         val result = TextView(this)
         result.textSize = 18f
@@ -146,85 +95,16 @@ class MainActivity : Activity() {
         col.addView(overlayBtn)
         col.addView(startBtn)
         col.addView(stopBtn)
-        col.addView(shizukuLabel)
-        col.addView(shizukuOut)
-        col.addView(grantBtn)
-        col.addView(openBtn)
-        col.addView(checkBtn)
         col.addView(posLabel)
         col.addView(posInput)
+        col.addView(levelBtn)
         col.addView(analyzeBtn)
         col.addView(result)
 
         val scroll = ScrollView(this)
         scroll.addView(col)
         setContentView(scroll)
-
-        refreshShizuku()
     }
-
-    override fun onResume() {
-        super.onResume()
-        refreshShizuku()
-    }
-
-    // -------------------------------------------------------------------- Shizuku
-
-    private fun refreshShizuku() {
-        val out = shizukuOut ?: return
-        out.text = try {
-            shizuku.report()
-        } catch (e: Throwable) {
-            "Shizuku: " + (e.message ?: e.javaClass.simpleName)
-        }
-    }
-
-    private fun requestShizukuPermission() {
-        val out = shizukuOut ?: return
-        try {
-            if (!shizuku.isRunning()) {
-                out.text = "Shizuku is not running yet. Open it, start it, then come back."
-                return
-            }
-            if (shizuku.hasPermission()) {
-                out.text = shizuku.report()
-                return
-            }
-            out.text = "Asking Shizuku for access…"
-            Shizuku.requestPermission(reqShizuku)
-        } catch (e: Throwable) {
-            out.text = "Could not ask Shizuku: " + (e.message ?: e.javaClass.simpleName)
-        }
-    }
-
-    private fun openShizuku() {
-        val launch = try {
-            packageManager.getLaunchIntentForPackage(ShizukuCapture.PACKAGE_SHIZUKU)
-        } catch (e: Throwable) {
-            null
-        }
-        if (launch != null) {
-            startActivity(launch)
-            return
-        }
-        // Not installed: the Play Store page is the quickest install path.
-        val market = Intent(
-            Intent.ACTION_VIEW,
-            Uri.parse("market://details?id=" + ShizukuCapture.PACKAGE_SHIZUKU)
-        )
-        try {
-            startActivity(market)
-        } catch (e: Throwable) {
-            startActivity(
-                Intent(
-                    Intent.ACTION_VIEW,
-                    Uri.parse("https://play.google.com/store/apps/details?id=" + ShizukuCapture.PACKAGE_SHIZUKU)
-                )
-            )
-        }
-    }
-
-    // -------------------------------------------------------------------- engine
 
     private fun analyze(input: String, out: TextView) {
         val text = input.trim()
@@ -257,6 +137,7 @@ class MainActivity : Activity() {
         out.text = "Thinking…"
         Thread {
             val e = engine ?: StockfishEngine(this).also { engine = it }
+            e.setStrength(getSharedPreferences("chess", MODE_PRIVATE).getInt("elo", 0))
             val available = e.available()
             val r = if (available) e.analyzeRaw(cmd, 1000) else null
             runOnUiThread {
@@ -279,7 +160,7 @@ class MainActivity : Activity() {
         } else if (cp != null) {
             String.format(Locale.US, "%+.2f", (if (black) -cp else cp) / 100.0)
         } else "?"
-        return (if (black) "Black" else "White") + " to move\nBest move: $b\nEval (White): $ev"
+        return (if (black) "Black" else "White") + " to move\nSuggested move: $b\nEval (White): $ev"
     }
 
     @Suppress("DEPRECATION")
@@ -295,10 +176,6 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
-        try {
-            Shizuku.removeRequestPermissionResultListener(permissionListener)
-        } catch (e: Throwable) {
-        }
         engine?.stop()
         super.onDestroy()
     }

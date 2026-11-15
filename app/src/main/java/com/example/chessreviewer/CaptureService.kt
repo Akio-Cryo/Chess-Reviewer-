@@ -42,6 +42,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.random.Random
 
 class CaptureService : Service() {
 
@@ -51,6 +52,18 @@ class CaptureService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
     private val tracker = Tracker()
+
+    // engine strength and pacing, shared with MainActivity through the "chess" preferences
+    private val rng = Random(System.currentTimeMillis())
+    private val eloSteps = intArrayOf(1320, 1600, 1900, 2200, 2500, 2800, 0)
+    private val MULTI_PV = 5
+    @Volatile private var elo: Int? = null
+    @Volatile private var humanPace = true
+
+    // the move showing on the panel, and when a person would plausibly play it
+    @Volatile private var playText: String? = null
+    @Volatile private var playAt = 0L
+    @Volatile private var playWindow = 0L..0L
 
     private var projection: MediaProjection? = null
     private var reader: ImageReader? = null
@@ -98,6 +111,7 @@ class CaptureService : Service() {
         prefs = getSharedPreferences("chess", MODE_PRIVATE)
         engine = StockfishEngine(this)
         secure = SecureCapture(this, cacheDir)
+        loadEngineSettings()
         whiteAtBottom = prefs.getBoolean("whiteBottom", true)
         prefs.getString("tpl", null)?.let { templates = Templates.parse(it) }
         prefs.getString("rect", null)?.let { s ->
@@ -130,6 +144,14 @@ class CaptureService : Service() {
             }
         }
         return START_NOT_STICKY
+    }
+
+    /** strength and pacing as chosen in MainActivity, or with the panel buttons */
+    private fun loadEngineSettings() {
+        val stored = prefs.getInt("elo", 0)
+        elo = if (stored <= 0) null else stored
+        humanPace = prefs.getBoolean("human", true)
+        engine.configure(elo, if (humanPace) MULTI_PV else 1)
     }
 
     private fun startAsForeground() {
@@ -362,11 +384,14 @@ class CaptureService : Service() {
     }
 
     private fun tick() {
+        refreshPlayStatus()
         if (resetRequested) {
             resetRequested = false
             observed = null; stablePos = null; stableKey = null
             pendingKey = null; pendingCount = 0
             tracker.reset()
+            playText = null
+            playAt = 0L
             reprocess = true
         }
 
@@ -517,36 +542,70 @@ class CaptureService : Service() {
             setStatus("Stockfish isn't inside this APK (libstockfish.so missing). Check the 'Download Stockfish' step of the build.")
             return
         }
+        engine.configure(elo, if (humanPace) MULTI_PV else 1)
         setStatus("Thinking…")
-        val r = engine.analyze(tracker.fen(pos))
+        // vary the search time as well: a fixed budget shows up as a fixed pause
+        val moveTime = if (humanPace) 500 + rng.nextInt(700) else 900
+        val r = engine.analyze(tracker.fen(pos), moveTime)
         if (r == null) {
             setStatus("The engine didn't answer. The position may be misread; try the Turn button.")
             return
         }
-        setStatus(describe(r, pos))
+        val chosen = Humanizer.chooseMove(r, elo, humanPace, rng)
+        val window = Humanizer.thinkWindowMs(r, pos, humanPace, rng)
+        playText = describe(chosen, pos)
+        playWindow = window
+        playAt = if (window.last <= 0L) {
+            0L
+        } else {
+            SystemClock.uptimeMillis() + window.first +
+                (rng.nextDouble() * (window.last - window.first)).toLong()
+        }
+        setStatus(playStatus())
     }
 
-    private fun describe(r: EngineResult, pos: CharArray): String {
+    /** the move on the panel, plus how long to sit on it before playing */
+    private fun playStatus(): String {
+        val base = playText ?: return ""
+        if (playAt <= 0L) return base + "\nPlay it now."
+        val left = playAt - SystemClock.uptimeMillis()
+        if (left <= 0L) {
+            playAt = 0L
+            return base + "\nPlay it now."
+        }
+        val secs = (left + 999) / 1000
+        val lo = playWindow.first / 1000
+        val hi = playWindow.last / 1000
+        return base + "\nPlay in " + secs + "s  (human pace " + lo + "-" + hi + "s)"
+    }
+
+    private fun refreshPlayStatus() {
+        if (playText == null || playAt == 0L) return
+        val text = playStatus()
+        if (text.isNotEmpty()) setStatus(text)
+    }
+
+    private fun describe(line: EngineLine, pos: CharArray): String {
         val black = tracker.blackToMove
         val side = if (black) "Black" else "White"
-        val b = r.best
+        val b = line.move
         if (b.length < 4 || b == "(none)") return "$side to move: no legal moves (game over?)"
         val from = (b[1] - '1') * 8 + (b[0] - 'a')
         val to = (b[3] - '1') * 8 + (b[2] - 'a')
-        if (from !in 0..63 || to !in 0..63) return "$side to move\nBest: $b"
+        if (from !in 0..63 || to !in 0..63) return "$side to move\nPlay: $b"
         val names = mapOf('p' to "Pawn", 'n' to "Knight", 'b' to "Bishop", 'r' to "Rook", 'q' to "Queen", 'k' to "King")
         val piece = pos[from].lowercaseChar()
         var move =
             if (piece == 'k' && abs(to % 8 - from % 8) == 2) {
                 if (to % 8 > from % 8) "Castle kingside" else "Castle queenside"
             } else {
-                (names[piece] ?: "Piece") + " " + b.substring(0, 2) + " → " + b.substring(2, 4)
+                (names[piece] ?: "Piece") + " " + b.substring(0, 2) + " -> " + b.substring(2, 4)
             }
         if (pos[to] != '.') move += " (capture)"
         if (b.length > 4) move += " =" + b[4].uppercaseChar()
 
-        val mate = r.mate
-        val cp = r.cp
+        val mate = line.mate
+        val cp = line.cp
         val ev = if (mate != null) {
             val m = if (black) -mate else mate
             if (m > 0) "White mates in $m" else "Black mates in ${-m}"
@@ -554,7 +613,7 @@ class CaptureService : Service() {
             val v = (if (black) -cp else cp) / 100.0
             String.format(Locale.US, "%+.2f", v)
         } else "?"
-        return "$side to move\nBest: $move  ($b)\nEval (White): $ev"
+        return "$side to move\nPlay: $move  ($b)\nEval (White): $ev"
     }
 
     // ------------------------------------------------------------------ overlay UI
@@ -596,6 +655,30 @@ class CaptureService : Service() {
         }
     }
 
+    private fun eloLabel(e: Int?): String = if (e == null) "Elo: max" else "Elo: $e"
+
+    private fun cycleElo(button: Button) {
+        val current = elo ?: 0
+        val index = eloSteps.indexOf(current).let { if (it < 0) eloSteps.size - 1 else it }
+        val next = eloSteps[(index + 1) % eloSteps.size]
+        elo = if (next == 0) null else next
+        prefs.edit().putInt("elo", next).apply()
+        button.text = eloLabel(elo)
+        setStatus(if (elo == null) "Engine at full strength." else "Engine limited to about $elo Elo.")
+        if (stablePos != null) scope.launch { runEngine() }
+    }
+
+    private fun togglePace(button: Button) {
+        humanPace = !humanPace
+        prefs.edit().putBoolean("human", humanPace).apply()
+        button.text = if (humanPace) "Pace: human" else "Pace: off"
+        setStatus(
+            if (humanPace) "Human pace on: the move may be one of the top few, and the panel gives you a delay to play it in."
+            else "Human pace off: always the engine's first choice, straight away."
+        )
+        if (stablePos != null) scope.launch { runEngine() }
+    }
+
     private fun buildPanel() {
         val d = resources.displayMetrics.density
         val pad = (8 * d).toInt()
@@ -611,28 +694,46 @@ class CaptureService : Service() {
         statusView = status
         root.addView(status)
 
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        fun addButton(label: String, action: () -> Unit) {
+        fun makeRow(): LinearLayout {
+            val r = LinearLayout(this)
+            r.orientation = LinearLayout.HORIZONTAL
+            root.addView(r)
+            return r
+        }
+        fun addButton(parent: LinearLayout, label: String, action: () -> Unit): Button {
             val b = Button(this)
             b.text = label
             b.textSize = 11f
             b.isAllCaps = false
             b.setPadding(2, 0, 2, 0)
             b.setOnClickListener { action() }
-            row.addView(b, LinearLayout.LayoutParams(0, (42 * d).toInt(), 1f))
+            parent.addView(b, LinearLayout.LayoutParams(0, (42 * d).toInt(), 1f))
+            return b
         }
-        addButton("Learn") { learnRequested = true; setStatus("Learning…") }
-        addButton("Flip") {
+        val row = makeRow()
+        addButton(row, "Learn") { learnRequested = true; playText = null; setStatus("Learning…") }
+        addButton(row, "Flip") {
             whiteAtBottom = !whiteAtBottom
             prefs.edit().putBoolean("whiteBottom", whiteAtBottom).apply()
             resetRequested = true
             setStatus("Board flipped: White is now at the " + (if (whiteAtBottom) "bottom." else "top."))
         }
-        addButton("Turn") { turnFlipRequested = true }
-        addButton("Save") { saveRequested = true; setStatus("Saving a picture…") }
-        addButton("Stop") { stopSelf() }
-        root.addView(row)
+        addButton(row, "Turn") { turnFlipRequested = true }
+        addButton(row, "Save") { saveRequested = true; setStatus("Saving a picture…") }
+        addButton(row, "Stop") { stopSelf() }
+
+        // strength and pacing, changeable without leaving the game
+        val row2 = makeRow()
+        val eloBtn = addButton(row2, eloLabel(elo)) { }
+        eloBtn.setOnClickListener { cycleElo(eloBtn) }
+        val paceBtn = addButton(row2, if (humanPace) "Pace: human" else "Pace: off") { }
+        paceBtn.setOnClickListener { togglePace(paceBtn) }
+        addButton(row2, "Again") {
+            if (stablePos != null) {
+                setStatus("Thinking again…")
+                scope.launch { runEngine() }
+            }
+        }
 
         val w = (screenW * 0.94f).toInt()
         val lp = overlayParams(w, WindowManager.LayoutParams.WRAP_CONTENT)
