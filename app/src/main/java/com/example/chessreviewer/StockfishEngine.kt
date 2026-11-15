@@ -41,8 +41,8 @@ class StockfishEngine(private val context: Context) {
     /** how many candidate moves to ask for; more than one lets the move choice be varied */
     @Volatile var multiPv: Int = 1
 
-    /** depth cap in plies for the steps driven by Skill Level, 0 for no cap */
-    @Volatile private var depthCap = 0
+    /** node budget for the steps driven by Skill Level, 0 for no limit */
+    @Volatile private var nodesCap = 0
 
     // what this particular Stockfish build says it accepts, read from its "uci" reply
     private var eloMin = 1320
@@ -96,31 +96,34 @@ class StockfishEngine(private val context: Context) {
      *
      * `UCI_Elo` and `Skill Level` are the same setting underneath: the engine turns an Elo into a
      * Skill Level, and `UCI_Elo`'s own floor is [eloMin] (1320 in current builds). A rating under
-     * that floor can only be sent as `Skill Level` itself, with the depth cap that belongs to it,
-     * which is the only way the engine's own weakening machinery runs that low.
+     * that floor can only be sent as `Skill Level` itself, with a node budget that shortens the
+     * search without blinding it.
      */
     private fun applyStrength() {
         val step = Levels.stepFor(elo)
         if (step == null) {
             if (hasLimitStrength) send("setoption name UCI_LimitStrength value false")
             if (hasSkillLevel) send("setoption name Skill Level value 20")
-            depthCap = 0
+            nodesCap = 0
+        } else if (step.skill != null && hasSkillLevel) {
+            // UCI_LimitStrength has to be off first, or the engine recomputes Skill Level
+            // from UCI_Elo and undoes the value set here
+            if (hasLimitStrength) send("setoption name UCI_LimitStrength value false")
+            send("setoption name Skill Level value ${step.skill.coerceIn(0, 20)}")
+            nodesCap = step.nodes
         } else {
-            if (step.skill != null && hasSkillLevel) {
-                // UCI_LimitStrength has to be off first, or the engine recomputes Skill Level
-                // from UCI_Elo and undoes the value set here
-                if (hasLimitStrength) send("setoption name UCI_LimitStrength value false")
-                send("setoption name Skill Level value ${step.skill.coerceIn(0, 20)}")
-            } else if (hasLimitStrength) {
+            // back to the neutral skill, so a build that recomputes it from UCI_Elo starts clean
+            if (hasSkillLevel) send("setoption name Skill Level value 20")
+            if (hasLimitStrength) {
                 send("setoption name UCI_Elo value ${step.elo.coerceIn(eloMin, eloMax)}")
                 send("setoption name UCI_LimitStrength value true")
             } else if (hasSkillLevel) {
-                // no UCI_Elo in this build: the nearest Skill Level for the rating asked for,
-                // with the floor of the scale at the floor of the Elo range
-                val skill = ((step.elo - Levels.FLOOR_ELO) / 74).coerceIn(0, 20)
-                send("setoption name Skill Level value $skill")
+                // no UCI_Elo in this build: the Skill Level that matches the rating asked for,
+                // spread across the range the engine advertises
+                val span = ((eloMax - eloMin) / 20).coerceAtLeast(1)
+                send("setoption name Skill Level value ${((step.elo - eloMin) / span).coerceIn(0, 20)}")
             }
-            depthCap = if (step.skill != null) step.depth else 0
+            nodesCap = 0
         }
         send("setoption name MultiPV value ${multiPv.coerceIn(1, 5)}")
     }
@@ -165,8 +168,8 @@ class StockfishEngine(private val context: Context) {
     fun analyzeRaw(positionCommand: String, moveTimeMs: Int = 400): EngineResult? {
         if (process?.isAlive != true && !start()) return null
         send(positionCommand)
-        val cap = depthCap
-        send(if (cap > 0) "go depth $cap movetime $moveTimeMs" else "go movetime $moveTimeMs")
+        val cap = nodesCap
+        send(if (cap > 0) "go nodes $cap movetime $moveTimeMs" else "go movetime $moveTimeMs")
 
         var cp: Int? = null
         var mate: Int? = null
@@ -202,10 +205,12 @@ class StockfishEngine(private val context: Context) {
                 val parts = text.split(" ")
                 val best = parts.getOrElse(1) { "" }
                 val ranked = candidates.toSortedMap().values.toList()
-                val withBest = if (ranked.isEmpty() || ranked[0].move != best) {
-                    listOf(EngineLine(best, cp, mate)) + ranked
-                } else {
-                    ranked
+                // when the engine's own pick is not the line it scored best, that pick has no
+                // score of its own here: leave it unknown rather than lending it the top one
+                val withBest = when {
+                    ranked.isEmpty() -> listOf(EngineLine(best, cp, mate))
+                    ranked[0].move == best -> ranked
+                    else -> listOf(EngineLine(best, null, null)) + ranked
                 }
                 return EngineResult(cp, mate, best, withBest)
             }

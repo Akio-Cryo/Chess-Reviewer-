@@ -9,45 +9,67 @@ import kotlin.random.Random
  *
  * Two things give an assisted game away to a review of the moves: every move being the engine's
  * first choice, and every move arriving after the same short pause. Both are avoidable without
- * making the play bad. The move is drawn from the top few lines that sit inside the centipawn
- * budget of the level picked, and the delay follows the shape of a human think (long in open
- * middlegames, short on forced recaptures and mate in one), with the exact second left open.
+ * making the play bad. Above Stockfish's own rating floor the move is drawn from the top few lines
+ * that sit inside the centipawn budget of the level picked. On the steps driven by Skill Level the
+ * engine has already made that choice itself, so this shows its move as it is: a second random pick
+ * on top of it was what made those steps play far below their label.
  */
 object Humanizer {
 
     /**
      * Centipawns a player of this level can be expected to give up on one move. The table lives in
-     * [Levels], because the steps under Stockfish's own UCI_Elo floor are given a much wider
-     * budget: the engine is already playing with Skill Level 0 and a depth cap there, and without
-     * the wider budget the play would still sit well above the rating on the label.
+     * [Levels]: it narrows all the way down to full strength, and under Stockfish's own UCI_Elo
+     * floor it is the main lever, because Skill Level 0 is already as strong as that floor.
      */
     fun slackCp(elo: Int?): Int = Levels.stepFor(elo)?.slackCp ?: 6
 
     /**
-     * Picks the move to show. At full strength with human pace off this is simply the engine's
-     * first choice; otherwise it is one of the moves within [slackCp] of it, weighted by how
-     * little it gives up, so the strong move is common and the loose one is occasional.
+     * Picks the move to show.
+     *
+     * On a step at or above Stockfish's rating floor the engine itself is as strong as its label
+     * says, so the choice is drawn from the top few lines inside [slackCp] of the best, weighted
+     * towards the best: the play stays strong and is not identically the engine's first choice
+     * every move.
+     *
+     * On a Skill Level step the engine has already chosen a weaker move than the best one, and that
+     * choice is the weakening: it is what is shown, most of the time. A share of the moves, set by
+     * [Levels.Step.mistakeChance], is drawn from a scored alternative inside the budget instead,
+     * which is the deliberate mistake that takes the step below the floor. Drawing purely from the
+     * scored lines there would throw the engine's own weakened pick away and, with a wide budget,
+     * amount to picking a near-random move; drawing never from them would leave the step playing
+     * at the floor whatever its label.
      */
     fun chooseMove(r: EngineResult, elo: Int?, human: Boolean, rnd: Random): EngineLine {
-        val lines = r.lines.ifEmpty { listOf(EngineLine(r.best, r.cp, r.mate)) }
+        val own = EngineLine(r.best, r.cp, r.mate)
+        val lines = r.lines.ifEmpty { listOf(own) }
         val top = lines.first()
-        if (!human || lines.size < 2) return top
+        if (!human) return own
         // a mate on the board gets played by anyone
-        val mateIn = top.mate
-        if (mateIn != null && mateIn > 0) return top
+        val mateIn = own.mate ?: top.mate
+        if (mateIn != null && mateIn in 1..2) return own
+
+        val step = Levels.stepFor(elo)
+        val budget = step?.slackCp ?: 6
+        // Stockfish's own pick is where its strength setting lives: at UCI_Elo it is a move the
+        // engine has already weakened to that rating, and at a Skill Level step it is the weaker
+        // move that step is for. Replacing it with the top scored line would play above the label,
+        // so it is the anchor here and only a bounded share of the moves departs from it.
+        if (step != null && step.usesSkill && rnd.nextFloat() >= step.mistakeChance) return own
+
+        if (lines.size < 2) return own
+        // the engine's own pick scored nothing in this list, so trust it over the picked lines
+        if (top.cp == null && top.mate == null) return own
 
         val best = top.score()
-        val budget = slackCp(elo)
-        val pool = lines.filter { best - it.score() <= budget }
-        if (pool.size < 2) return top
+        val pool = lines.filter { it.move != r.best && best - it.score() <= budget && it.cp != null }
+        if (pool.isEmpty()) return own
 
-        // how flat the choice is inside the budget: a beginner's move is close to a coin toss
-        // between what the engine liked, where a strong player's is nearly always the first line
-        val flattener = if ((elo ?: 3190) >= Levels.FLOOR_ELO) 0.5f else 0.85f
-        val temperature = (budget * flattener).coerceAtLeast(4f).toDouble()
+        // a quarter of the budget is the temperature, so the engine's best stays the common choice
+        // and a move at the edge of the budget is the occasional mistake this level actually makes
+        val temperature = (budget / 4f).coerceAtLeast(4f).toDouble()
         val weights = pool.map { exp(-(best - it.score()) / temperature) }
         val total = weights.sum()
-        if (total <= 0.0) return top
+        if (total <= 0.0) return own
         var roll = rnd.nextDouble() * total
         for (i in pool.indices) {
             roll -= weights[i]

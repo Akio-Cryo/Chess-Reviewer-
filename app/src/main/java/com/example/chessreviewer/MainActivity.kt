@@ -156,12 +156,13 @@ class MainActivity : Activity() {
             "Stockfish plays weaker two ways. Down to 1320 the limit is its own UCI_Elo, which " +
             "is the setting that maps to a real rating. Under that it has nothing better to say, so " +
             "the steps below 1320 switch to its Skill Level option (0 to 20, the same scale UCI_Elo " +
-            "is translated into) and cap how deep it searches, which is what actually reaches " +
-            "beginner strength. On those steps the move picker is also allowed to give up far more " +
-            "material, so a 400 level plays like a 400 player rather than a 1320 one that thinks less.\n\n" +
-            "Human pace picks between the top few moves inside that budget and shows a delay drawn " +
-            "from a believable think time, so neither the choice nor the timing arrives the same way " +
-            "twice.\n\n" +
+            "is translated into) with a node budget instead of a depth cap, which shortens the " +
+            "search without blinding it: a depth cap leaves the engine unable to score the moves it " +
+            "is choosing between, and the play turns into random moves rather than weak ones. On " +
+            "those steps the move shown is drawn from the engine's top five moves inside a " +
+            "centipawn budget, so most moves are still its first choice and the occasional one is " +
+            "the kind of mistake a player of that level makes.\n\n" +
+            "Human pace varies the choice and the timing, so neither arrives the same way twice.\n\n" +
             "Neither of those guarantees anything by itself: chess.com reviews finished games " +
             "statistically, and assistance in a live or rated game is against its fair play rules."
 
@@ -289,7 +290,8 @@ class MainActivity : Activity() {
         val p = getSharedPreferences("chess", MODE_PRIVATE)
         val e = engine ?: return
         val stored = p.getInt("elo", 0)
-        e.configure(if (stored <= 0) null else stored, if (p.getBoolean("human", true)) 5 else 1)
+        e.configure(if (stored <= 0) null else stored,
+            if (p.getBoolean("human", true)) Levels.multiPvFor(stored) else 1)
     }
 
     private fun analyze(input: String, out: TextView) {

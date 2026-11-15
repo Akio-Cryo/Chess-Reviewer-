@@ -55,7 +55,6 @@ class CaptureService : Service() {
 
     // engine strength and pacing, shared with MainActivity through the "chess" preferences
     private val rng = Random(System.currentTimeMillis())
-    private val MULTI_PV = 5
     @Volatile private var elo: Int? = null
     @Volatile private var humanPace = true
 
@@ -150,7 +149,7 @@ class CaptureService : Service() {
         val stored = prefs.getInt("elo", 0)
         elo = if (stored <= 0) null else stored
         humanPace = prefs.getBoolean("human", true)
-        engine.configure(elo, if (humanPace) MULTI_PV else 1)
+        engine.configure(elo, if (humanPace) Levels.multiPvFor(elo) else 1)
     }
 
     private fun startAsForeground() {
@@ -541,7 +540,7 @@ class CaptureService : Service() {
             setStatus("Stockfish isn't inside this APK (libstockfish.so missing). Check the 'Download Stockfish' step of the build.")
             return
         }
-        engine.configure(elo, if (humanPace) MULTI_PV else 1)
+        engine.configure(elo, if (humanPace) Levels.multiPvFor(elo) else 1)
         setStatus("Thinking…")
         // vary the search time as well: a fixed budget shows up as a fixed pause
         val moveTime = if (humanPace) 500 + rng.nextInt(700) else 900
@@ -659,8 +658,8 @@ class CaptureService : Service() {
     /** what the engine is actually doing at the current step, for the panel's status line */
     private fun strengthStatus(): String {
         val step = Levels.stepFor(elo) ?: return "Engine at full strength."
-        return if (step.skill != null) {
-            "Engine at about ${step.elo} Elo (Skill Level ${step.skill}, depth cap ${step.depth})."
+        return if (step.usesSkill) {
+            "Engine at about ${step.elo} Elo (Skill Level ${step.skill}, ${step.nodes} nodes)."
         } else {
             "Engine limited to about ${step.elo} Elo."
         }
