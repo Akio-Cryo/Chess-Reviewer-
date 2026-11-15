@@ -13,7 +13,7 @@ android {
         targetSdk = 34
         // Goes up with every GitHub build so new releases install over old ones.
         versionCode = 100 + (System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0)
-        versionName = "1.2"
+        versionName = "1.5"
     }
 
     // Release signing: the workflow supplies these from GitHub secrets.
