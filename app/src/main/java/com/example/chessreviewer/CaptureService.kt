@@ -55,7 +55,6 @@ class CaptureService : Service() {
 
     // engine strength and pacing, shared with MainActivity through the "chess" preferences
     private val rng = Random(System.currentTimeMillis())
-    private val eloSteps = intArrayOf(1320, 1600, 1900, 2200, 2500, 2800, 0)
     private val MULTI_PV = 5
     @Volatile private var elo: Int? = null
     @Volatile private var humanPace = true
@@ -657,14 +656,29 @@ class CaptureService : Service() {
 
     private fun eloLabel(e: Int?): String = if (e == null) "Elo: max" else "Elo: $e"
 
-    private fun cycleElo(button: Button) {
+    /** what the engine is actually doing at the current step, for the panel's status line */
+    private fun strengthStatus(): String {
+        val step = Levels.stepFor(elo) ?: return "Engine at full strength."
+        return if (step.skill != null) {
+            "Engine at about ${step.elo} Elo (Skill Level ${step.skill}, depth cap ${step.depth})."
+        } else {
+            "Engine limited to about ${step.elo} Elo."
+        }
+    }
+
+    /**
+     * Steps the strength by one. A tap goes up the list, a long press down it: the list now runs
+     * from 400 Elo to full strength, and walking ten steps one way to get back is no good.
+     */
+    private fun cycleElo(button: Button, down: Boolean = false) {
+        val steps = Levels.storedValues
         val current = elo ?: 0
-        val index = eloSteps.indexOf(current).let { if (it < 0) eloSteps.size - 1 else it }
-        val next = eloSteps[(index + 1) % eloSteps.size]
+        val index = steps.indexOf(current).let { if (it < 0) steps.size - 1 else it }
+        val next = steps[if (down) (index - 1 + steps.size) % steps.size else (index + 1) % steps.size]
         elo = if (next == 0) null else next
         prefs.edit().putInt("elo", next).apply()
         button.text = eloLabel(elo)
-        setStatus(if (elo == null) "Engine at full strength." else "Engine limited to about $elo Elo.")
+        setStatus(strengthStatus())
         if (stablePos != null) scope.launch { runEngine() }
     }
 
@@ -726,6 +740,7 @@ class CaptureService : Service() {
         val row2 = makeRow()
         val eloBtn = addButton(row2, eloLabel(elo)) { }
         eloBtn.setOnClickListener { cycleElo(eloBtn) }
+        eloBtn.setOnLongClickListener { cycleElo(eloBtn, down = true); true }
         val paceBtn = addButton(row2, if (humanPace) "Pace: human" else "Pace: off") { }
         paceBtn.setOnClickListener { togglePace(paceBtn) }
         addButton(row2, "Again") {

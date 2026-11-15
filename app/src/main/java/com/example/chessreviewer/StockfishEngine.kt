@@ -7,48 +7,48 @@ import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 
-/**
- * Engine strength presets, stored as one number:
- * 0 = full strength, 1320..3190 = approximate Elo, 100..120 = Stockfish "Skill Level" 0..20 (100 + level).
- */
-object Levels {
-    val list = intArrayOf(0, 2800, 2400, 2000, 1600, 1320, 112, 108, 104, 100)
-    fun next(cur: Int): Int = list[(list.indexOf(cur) + 1) % list.size]
-    fun label(v: Int): String =
-        if (v <= 0) "Max"
-        else if (v in 100..120) "Skill ${v - 100} of 20"
-        else "$v Elo"
+/** One candidate move from the engine's last search, scored from the side to move's point of view. */
+class EngineLine(val move: String, val cp: Int?, val mate: Int?) {
+    /** one comparable number, in centipawns, with mates counted as (almost) infinite */
+    fun score(): Int = when {
+        mate != null && mate > 0 -> 100000 - mate * 100
+        mate != null -> -100000 - mate * 100
+        cp != null -> cp
+        else -> 0
+    }
 }
 
-/** cp / mate are from the point of view of the side to move (UCI convention). */
-class EngineResult(val cp: Int?, val mate: Int?, val best: String)
+/**
+ * cp / mate are from the point of view of the side to move (UCI convention).
+ * [lines] holds the ranked candidates the engine reported, best first; with MultiPV 1 it is
+ * empty and the caller should just play [best].
+ */
+class EngineResult(
+    val cp: Int?,
+    val mate: Int?,
+    val best: String,
+    val lines: List<EngineLine> = emptyList()
+)
 
 class StockfishEngine(private val context: Context) {
     private var process: Process? = null
     private var reader: BufferedReader? = null
     private var writer: BufferedWriter? = null
 
-    @Volatile private var strength = 0   // 0 = full strength, else target Elo
-    private var applied = -1             // strength last sent to the running engine
+    /** null = full strength; otherwise the rating the engine is limited to */
+    @Volatile var elo: Int? = null
 
-    /** takes effect on the next analysis */
-    fun setStrength(elo: Int) { strength = elo }
+    /** how many candidate moves to ask for; more than one lets the move choice be varied */
+    @Volatile var multiPv: Int = 1
 
-    private fun applyStrengthIfNeeded() {
-        if (applied == strength) return
-        if (strength <= 0) {
-            send("setoption name UCI_LimitStrength value false")
-            send("setoption name Skill Level value 20")
-        } else if (strength in 100..120) {
-            send("setoption name UCI_LimitStrength value false")
-            send("setoption name Skill Level value ${strength - 100}")
-        } else {
-            send("setoption name Skill Level value 20")
-            send("setoption name UCI_LimitStrength value true")
-            send("setoption name UCI_Elo value $strength")
-        }
-        applied = strength
-    }
+    /** depth cap in plies for the steps driven by Skill Level, 0 for no cap */
+    @Volatile private var depthCap = 0
+
+    // what this particular Stockfish build says it accepts, read from its "uci" reply
+    private var eloMin = 1320
+    private var eloMax = 3190
+    private var hasLimitStrength = false
+    private var hasSkillLevel = false
 
     private fun binary() = File(context.applicationInfo.nativeLibraryDir, "libstockfish.so")
 
@@ -65,15 +65,64 @@ class StockfishEngine(private val context: Context) {
             reader = BufferedReader(InputStreamReader(p.inputStream))
             writer = BufferedWriter(OutputStreamWriter(p.outputStream))
             send("uci")
-            if (!waitFor("uciok")) return false
+            if (!waitFor("uciok", readOptions = true)) return false
             send("setoption name Threads value 2")
             send("setoption name Hash value 64")
-            applied = -1
+            applyStrength()
             send("isready")
             waitFor("readyok")
         } catch (e: Exception) {
             false
         }
+    }
+
+    /**
+     * Sets how strong the engine plays and how many candidate moves it reports. Safe to call
+     * while it is running: the new limits apply to the next search.
+     */
+    @Synchronized
+    fun configure(elo: Int?, multiPv: Int) {
+        this.elo = elo
+        this.multiPv = multiPv
+        if (process?.isAlive == true) {
+            applyStrength()
+            send("isready")
+            waitFor("readyok")
+        }
+    }
+
+    /**
+     * Pushes the current strength setting into the engine.
+     *
+     * `UCI_Elo` and `Skill Level` are the same setting underneath: the engine turns an Elo into a
+     * Skill Level, and `UCI_Elo`'s own floor is [eloMin] (1320 in current builds). A rating under
+     * that floor can only be sent as `Skill Level` itself, with the depth cap that belongs to it,
+     * which is the only way the engine's own weakening machinery runs that low.
+     */
+    private fun applyStrength() {
+        val step = Levels.stepFor(elo)
+        if (step == null) {
+            if (hasLimitStrength) send("setoption name UCI_LimitStrength value false")
+            if (hasSkillLevel) send("setoption name Skill Level value 20")
+            depthCap = 0
+        } else {
+            if (step.skill != null && hasSkillLevel) {
+                // UCI_LimitStrength has to be off first, or the engine recomputes Skill Level
+                // from UCI_Elo and undoes the value set here
+                if (hasLimitStrength) send("setoption name UCI_LimitStrength value false")
+                send("setoption name Skill Level value ${step.skill.coerceIn(0, 20)}")
+            } else if (hasLimitStrength) {
+                send("setoption name UCI_Elo value ${step.elo.coerceIn(eloMin, eloMax)}")
+                send("setoption name UCI_LimitStrength value true")
+            } else if (hasSkillLevel) {
+                // no UCI_Elo in this build: the nearest Skill Level for the rating asked for,
+                // with the floor of the scale at the floor of the Elo range
+                val skill = ((step.elo - Levels.FLOOR_ELO) / 74).coerceIn(0, 20)
+                send("setoption name Skill Level value $skill")
+            }
+            depthCap = if (step.skill != null) step.depth else 0
+        }
+        send("setoption name MultiPV value ${multiPv.coerceIn(1, 5)}")
     }
 
     private fun send(cmd: String) {
@@ -84,13 +133,28 @@ class StockfishEngine(private val context: Context) {
         }
     }
 
-    private fun waitFor(token: String): Boolean {
+    private fun waitFor(token: String, readOptions: Boolean = false): Boolean {
         var line = reader?.readLine()
         while (line != null) {
+            if (readOptions) noteOption(line)
             if (line.startsWith(token)) return true
             line = reader?.readLine()
         }
         return false
+    }
+
+    /** remembers the strength options this build advertises, so the Elo is clamped to them */
+    private fun noteOption(line: String) {
+        if (!line.startsWith("option name ")) return
+        val name = line.removePrefix("option name ").substringBefore(" type ")
+        when (name) {
+            "UCI_Elo" -> {
+                UCI_ELO_MIN.find(line)?.groupValues?.get(1)?.toIntOrNull()?.let { eloMin = it }
+                UCI_ELO_MAX.find(line)?.groupValues?.get(1)?.toIntOrNull()?.let { eloMax = it }
+            }
+            "UCI_LimitStrength" -> hasLimitStrength = true
+            "Skill Level" -> hasSkillLevel = true
+        }
     }
 
     fun analyze(fen: String, moveTimeMs: Int = 400): EngineResult? =
@@ -100,24 +164,50 @@ class StockfishEngine(private val context: Context) {
     @Synchronized
     fun analyzeRaw(positionCommand: String, moveTimeMs: Int = 400): EngineResult? {
         if (process?.isAlive != true && !start()) return null
-        applyStrengthIfNeeded()
         send(positionCommand)
-        send("go movetime $moveTimeMs")
+        val cap = depthCap
+        send(if (cap > 0) "go depth $cap movetime $moveTimeMs" else "go movetime $moveTimeMs")
 
         var cp: Int? = null
         var mate: Int? = null
+        val candidates = HashMap<Int, EngineLine>()
         var line = reader?.readLine()
         while (line != null) {
-            if (line.contains(" score cp ")) {
-                cp = line.substringAfter(" score cp ").substringBefore(" ").toIntOrNull()
-                mate = null
-            } else if (line.contains(" score mate ")) {
-                mate = line.substringAfter(" score mate ").substringBefore(" ").toIntOrNull()
-                cp = null
+            val text = line
+            if (text.startsWith("info ")) {
+                if (text.contains(" pv ")) {
+                    val index = MULTIPV.find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 1
+                    val cpScore = SCORE_CP.find(text)?.groupValues?.get(1)?.toIntOrNull()
+                    val mateScore = SCORE_MATE.find(text)?.groupValues?.get(1)?.toIntOrNull()
+                    val move = text.substringAfter(" pv ").trim().substringBefore(' ')
+                    if (move.length >= 4) {
+                        candidates[index] = EngineLine(move, if (mateScore == null) cpScore else null, mateScore)
+                        if (index == 1) {
+                            cp = if (mateScore == null) cpScore else null
+                            mate = mateScore
+                        }
+                    }
+                } else if (text.contains(" score ")) {
+                    // some builds print a score before the first pv line
+                    val mateScore = SCORE_MATE.find(text)?.groupValues?.get(1)?.toIntOrNull()
+                    if (mateScore != null) {
+                        mate = mateScore
+                        cp = null
+                    } else {
+                        SCORE_CP.find(text)?.groupValues?.get(1)?.toIntOrNull()?.let { cp = it }
+                    }
+                }
             }
-            if (line.startsWith("bestmove")) {
-                val parts = line.split(" ")
-                return EngineResult(cp, mate, parts.getOrElse(1) { "" })
+            if (text.startsWith("bestmove")) {
+                val parts = text.split(" ")
+                val best = parts.getOrElse(1) { "" }
+                val ranked = candidates.toSortedMap().values.toList()
+                val withBest = if (ranked.isEmpty() || ranked[0].move != best) {
+                    listOf(EngineLine(best, cp, mate)) + ranked
+                } else {
+                    ranked
+                }
+                return EngineResult(cp, mate, best, withBest)
             }
             line = reader?.readLine()
         }
@@ -132,5 +222,13 @@ class StockfishEngine(private val context: Context) {
         process = null
         reader = null
         writer = null
+    }
+
+    private companion object {
+        val MULTIPV = Regex("multipv (\\d+)")
+        val SCORE_CP = Regex("score cp (-?\\d+)")
+        val SCORE_MATE = Regex("score mate (-?\\d+)")
+        val UCI_ELO_MIN = Regex("min (-?\\d+)")
+        val UCI_ELO_MAX = Regex("max (-?\\d+)")
     }
 }
