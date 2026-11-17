@@ -40,8 +40,16 @@ object Humanizer {
      * at the floor whatever its label.
      */
     fun chooseMove(r: EngineResult, elo: Int?, human: Boolean, rnd: Random): EngineLine {
-        val own = EngineLine(r.best, r.cp, r.mate)
-        val lines = r.lines.ifEmpty { listOf(own) }
+        // the engine's own pick first, but never a pick that is not a move: when it reports
+        // "(none)", or nothing at all, and yet scored candidate lines, play the best of those
+        // instead of handing back something the panel cannot show
+        val scored = r.lines.filter { isMove(it.move) }
+        val own = if (isMove(r.best)) {
+            EngineLine(r.best, r.cp, r.mate)
+        } else {
+            scored.firstOrNull() ?: EngineLine(r.best, r.cp, r.mate)
+        }
+        val lines = if (scored.isEmpty()) listOf(own) else scored
         val top = lines.first()
         if (!human) return own
         // a mate on the board gets played by anyone
@@ -56,12 +64,16 @@ object Humanizer {
         // so it is the anchor here and only a bounded share of the moves departs from it.
         if (step != null && step.usesSkill && rnd.nextFloat() >= step.mistakeChance) return own
 
+        // nothing to choose between: the engine's own move is the answer, not an empty one
         if (lines.size < 2) return own
         // the engine's own pick scored nothing in this list, so trust it over the picked lines
         if (top.cp == null && top.mate == null) return own
 
         val best = top.score()
-        val pool = lines.filter { it.move != r.best && best - it.score() <= budget && it.cp != null }
+        // a mate score is not a centipawn evaluation: weighing alternatives against it would call
+        // every one of them either free or infinitely expensive, so play the engine's own move
+        if (best >= MATE_SCORE || best <= -MATE_SCORE) return own
+        val pool = lines.filter { it.move != own.move && best - it.score() <= budget && it.cp != null }
         if (pool.isEmpty()) return own
 
         // a quarter of the budget is the temperature, so the engine's best stays the common choice
@@ -117,4 +129,14 @@ object Humanizer {
         if (file !in 0..7 || rank !in 0..7) return false
         return pos[rank * 8 + file] != '.'
     }
+
+    /**
+     * Whether a string from the engine is a move at all. `bestmove (none)` is what it says on a
+     * position with no legal move, and an empty string is what it says when the line is cut off;
+     * neither can be shown as a move or sent to the board.
+     */
+    fun isMove(move: String): Boolean = move.length >= 4 && move[0] in 'a'..'h'
+
+    /** above this, a score is a mate count rather than a centipawn evaluation (see [EngineLine.score]) */
+    private const val MATE_SCORE = 50_000
 }

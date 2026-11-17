@@ -59,21 +59,28 @@ class StockfishEngine(private val context: Context) {
         stop()
         val bin = binary()
         if (!bin.exists()) return false
-        return try {
-            val p = ProcessBuilder(bin.absolutePath).redirectErrorStream(true).start()
-            process = p
-            reader = BufferedReader(InputStreamReader(p.inputStream))
-            writer = BufferedWriter(OutputStreamWriter(p.outputStream))
-            send("uci")
-            if (!waitFor("uciok", readOptions = true)) return false
-            send("setoption name Threads value 2")
-            send("setoption name Hash value 64")
-            applyStrength()
-            send("isready")
-            waitFor("readyok")
+        val p = try {
+            ProcessBuilder(bin.absolutePath).redirectErrorStream(true).start()
         } catch (e: Exception) {
-            false
+            return false
         }
+        process = p
+        reader = BufferedReader(InputStreamReader(p.inputStream))
+        writer = BufferedWriter(OutputStreamWriter(p.outputStream))
+        send("uci")
+        if (!waitFor("uciok", START_TIMEOUT_MS, readOptions = true)) {
+            stop()
+            return false
+        }
+        send("setoption name Threads value 2")
+        send("setoption name Hash value 64")
+        applyStrength()
+        send("isready")
+        if (!waitFor("readyok", READY_TIMEOUT_MS)) {
+            stop()
+            return false
+        }
+        return true
     }
 
     /**
@@ -87,7 +94,10 @@ class StockfishEngine(private val context: Context) {
         if (process?.isAlive == true) {
             applyStrength()
             send("isready")
-            waitFor("readyok")
+            // a build that chokes on one of these options can take the process down with it, and a
+            // read that never answers is worse than a restart: treat a missing readyok as a dead
+            // engine, so the next search starts a clean one
+            if (!waitFor("readyok", READY_TIMEOUT_MS)) stop()
         }
     }
 
@@ -136,14 +146,40 @@ class StockfishEngine(private val context: Context) {
         }
     }
 
-    private fun waitFor(token: String, readOptions: Boolean = false): Boolean {
-        var line = reader?.readLine()
-        while (line != null) {
+    /**
+     * Waits for one line of output, but never forever: the read gives up at the deadline.
+     *
+     * A blocking `readLine()` on a process that has gone quiet is how a move request used to hang
+     * with nothing on the panel, so every read in this class carries a deadline.
+     */
+    private fun waitFor(token: String, timeoutMs: Long = READY_TIMEOUT_MS, readOptions: Boolean = false): Boolean {
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000L
+        while (true) {
+            val line = readLineBy(deadline) ?: return false
             if (readOptions) noteOption(line)
             if (line.startsWith(token)) return true
-            line = reader?.readLine()
         }
-        return false
+    }
+
+    /**
+     * The next line from the engine, or null at [deadlineNanos] or at end of stream.
+     *
+     * UCI writes whole lines, so polling for a readable buffer is safe here and cheaper than a
+     * reader thread. A partial line without its newline inside the buffer would still block the
+     * read, but a process that stops mid-line has closed the stream, and that returns null.
+     */
+    private fun readLineBy(deadlineNanos: Long): String? {
+        val r = reader ?: return null
+        while (System.nanoTime() < deadlineNanos) {
+            if (r.ready()) return r.readLine()
+            try {
+                Thread.sleep(POLL_MS)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return null
+            }
+        }
+        return null
     }
 
     /** remembers the strength options this build advertises, so the Elo is clamped to them */
@@ -168,15 +204,28 @@ class StockfishEngine(private val context: Context) {
     fun analyzeRaw(positionCommand: String, moveTimeMs: Int = 400): EngineResult? {
         if (process?.isAlive != true && !start()) return null
         send(positionCommand)
-        val cap = nodesCap
-        send(if (cap > 0) "go nodes $cap movetime $moveTimeMs" else "go movetime $moveTimeMs")
+        // every search carries a depth ceiling and a move time: see Levels.goCommand
+        val thinkMs = Levels.thinkTimeMs(moveTimeMs)
+        send(Levels.goCommand(thinkMs, nodesCap))
 
         var cp: Int? = null
         var mate: Int? = null
         val candidates = HashMap<Int, EngineLine>()
-        var line = reader?.readLine()
-        while (line != null) {
-            val text = line
+        var deadline = System.nanoTime() + (thinkMs + Levels.SEARCH_GRACE_MS) * 1_000_000L
+        var stopSent = false
+
+        while (true) {
+            val text = readLineBy(deadline)
+            if (text == null) {
+                // end of stream: the engine went away mid-search
+                if (reader == null || process?.isAlive != true) break
+                if (stopSent) break
+                // it outlived its own movetime: stop it, then give it a moment to answer
+                send("stop")
+                stopSent = true
+                deadline = System.nanoTime() + STOP_GRACE_MS * 1_000_000L
+                continue
+            }
             if (text.startsWith("info ")) {
                 if (text.contains(" pv ")) {
                     val index = MULTIPV.find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 1
@@ -214,10 +263,40 @@ class StockfishEngine(private val context: Context) {
                 }
                 return EngineResult(cp, mate, best, withBest)
             }
-            line = reader?.readLine()
         }
-        stop() // engine died (e.g. illegal position); it restarts on the next call
-        return null
+
+        // no bestmove line arrived, but the search may have scored something: stop it and take what
+        // it has rather than leave the caller with nothing to show
+        val ranked = candidates.toSortedMap().values.toList()
+        settle()
+        if (ranked.isNotEmpty()) {
+            val top = ranked[0]
+            return EngineResult(top.cp, top.mate, top.move, ranked)
+        }
+        return null // the engine is stopped now, so the next request starts a clean one
+    }
+
+    /**
+     * Leaves the engine idle after a search that never reported its own bestmove.
+     *
+     * Without this the abandoned search keeps running while the next `position` and `go` are
+     * written, and the bestmove it eventually prints is read as the answer to the *next* position:
+     * the panel then shows a move from the previous board. So the search is stopped here and its
+     * bestmove consumed. An engine that will not answer even the stop is restarted, because a clean
+     * process is worth more than one whose state cannot be read.
+     */
+    private fun settle() {
+        if (process?.isAlive != true) {
+            stop()
+            return
+        }
+        send("stop")
+        val deadline = System.nanoTime() + STOP_GRACE_MS * 1_000_000L
+        while (true) {
+            val line = readLineBy(deadline) ?: break
+            if (line.startsWith("bestmove")) return
+        }
+        stop()
     }
 
     @Synchronized
@@ -230,6 +309,18 @@ class StockfishEngine(private val context: Context) {
     }
 
     private companion object {
+        /** how long to wait for "uciok" when the process has just been started */
+        const val START_TIMEOUT_MS = 8_000L
+
+        /** how long "isready" may take; it is answered immediately unless the engine is gone */
+        const val READY_TIMEOUT_MS = 3_000L
+
+        /** how long to wait for the bestmove after asking a search to stop */
+        const val STOP_GRACE_MS = 800L
+
+        /** how often a quiet engine's stream is checked again while waiting for a line */
+        const val POLL_MS = 5L
+
         val MULTIPV = Regex("multipv (\\d+)")
         val SCORE_CP = Regex("score cp (-?\\d+)")
         val SCORE_MATE = Regex("score mate (-?\\d+)")

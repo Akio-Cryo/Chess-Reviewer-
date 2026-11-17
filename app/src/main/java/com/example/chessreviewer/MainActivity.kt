@@ -8,6 +8,8 @@ import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.View
 import android.widget.AdapterView
@@ -29,6 +31,34 @@ class MainActivity : Activity() {
     private var engine: StockfishEngine? = null
     private lateinit var shizuku: ShizukuCapture
     private var shizukuOut: TextView? = null
+    /** the panel's current failure, repeated at the top of this screen in the same words */
+    private var faultView: TextView? = null
+    /** the one button that fixes it here: overlay permission, a fresh consent, or another try */
+    private var faultBtn: Button? = null
+    /** a failure this screen saw itself, which is newer than whatever the panel last reported */
+    private var screenFault: CaptureFault? = null
+    private var screenDetail = ""
+    /** the last cause already announced by a toast, so a visit back here does not repeat it */
+    private var toastedFault: CaptureFault? = null
+    /** the cause and detail last written onto [faultView], so the poll below only redraws on a change */
+    private var shownFault: CaptureFault? = null
+    private var shownDetail = ""
+    /** whether [faultPoll] may re-post itself, so a pause or destroy that lands mid-run stops it too */
+    private var faultPolling = false
+
+    private val handler = Handler(Looper.getMainLooper())
+
+    /**
+     * The panel can raise a cause while this screen is already in front, so its [CaptureService.lastFault]
+     * is re-read on a poll while the screen is visible. Started in [onResume], stopped in [onPause].
+     */
+    private val faultPoll = object : Runnable {
+        override fun run() {
+            showFault()
+            // a pause or destroy can land between showFault and here, so re-post only while still polling
+            if (faultPolling) handler.postDelayed(this, FAULT_POLL_MS)
+        }
+    }
 
     private val permissionListener =
         Shizuku.OnRequestPermissionResultListener { requestCode, _ ->
@@ -59,6 +89,8 @@ class MainActivity : Activity() {
             "3. Open your chess game so the whole board is visible. A small panel floats at the bottom.\n" +
             "4. With the pieces in the START position, tap 'Learn' (once per piece set).\n" +
             "5. Play. The board is found automatically and the best move updates by itself.\n\n" +
+            "If it stops working, the floating panel says which part failed and why, and its Retry button " +
+            "fixes it without restarting anything. The same sentence appears at the top of this screen.\n\n" +
             "Flip = swap which side is at the bottom. Turn = swap whose turn it is. " +
             "Save = writes a picture of what the app sees to Pictures/ChessReviewer (for debugging). " +
             "Engine strength and human pace are set further down this screen; the floating panel has " +
@@ -69,23 +101,26 @@ class MainActivity : Activity() {
             "(Android 11 and newer), then tap 'Grant Shizuku access' here. Protected screens are " +
             "readable that way on Android 12 and newer; on older versions only root can read them."
 
+        // The floating panel can be invisible when overlay permission is what failed, so the current
+        // failure is repeated here, where it can always be seen, with the one action this screen can
+        // take for it. The sentence is [CaptureFault.panelText], the same call the panel makes.
+        val faultView = TextView(this)
+        faultView.textSize = 15f
+        faultView.setTextColor(0xFFB00020.toInt())
+        faultView.visibility = View.GONE
+        this.faultView = faultView
+
+        val faultBtn = Button(this)
+        faultBtn.visibility = View.GONE
+        this.faultBtn = faultBtn
+
         val overlayBtn = Button(this)
         overlayBtn.text = "Allow overlay"
-        overlayBtn.setOnClickListener {
-            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
-        }
+        overlayBtn.setOnClickListener { openOverlaySettings() }
 
         val startBtn = Button(this)
         startBtn.text = "Start"
-        startBtn.setOnClickListener {
-            if (!Settings.canDrawOverlays(this)) {
-                Toast.makeText(this, "Allow 'Display over other apps' first", Toast.LENGTH_LONG).show()
-            } else {
-                val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                @Suppress("DEPRECATION")
-                startActivityForResult(mpm.createScreenCaptureIntent(), reqCapture)
-            }
-        }
+        startBtn.setOnClickListener { requestCaptureConsent() }
 
         val stopBtn = Button(this)
         stopBtn.text = "Stop"
@@ -197,6 +232,9 @@ class MainActivity : Activity() {
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
         col.setPadding(40, 80, 40, 80)
+        // the current failure goes first: on this screen the panel may be invisible or behind the game
+        col.addView(faultView)
+        col.addView(faultBtn)
         col.addView(info)
         col.addView(overlayBtn)
         col.addView(startBtn)
@@ -220,11 +258,121 @@ class MainActivity : Activity() {
         setContentView(scroll)
 
         refreshShizuku()
+        showFault()
+        // The panel asks for a fresh consent by starting this screen with EXTRA_RECONSENT; that is how
+        // its Retry works when the capture token has been spent.
+        if (consumeReconsent(intent)) requestCaptureConsent()
+    }
+
+    /**
+     * The panel starts this screen with [EXTRA_RECONSENT] while the service keeps running. The system
+     * consent dialog has to come from an Activity, and the token it answers with goes back to the
+     * service through [onActivityResult], which swaps the capture session underneath the panel.
+     */
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (consumeReconsent(intent)) requestCaptureConsent()
+    }
+
+    /**
+     * Takes [EXTRA_RECONSENT] off the Intent that carried it, so one request raises one consent dialog.
+     * The Activity keeps its Intent across a configuration change, and an extra left on it would ask
+     * again on every rotation.
+     */
+    private fun consumeReconsent(from: Intent?): Boolean {
+        if (from == null || !from.getBooleanExtra(EXTRA_RECONSENT, false)) return false
+        from.removeExtra(EXTRA_RECONSENT)
+        return true
     }
 
     override fun onResume() {
         super.onResume()
         refreshShizuku()
+        // coming back from the overlay settings or the consent dialog: the cause may have changed
+        showFault()
+        // the panel stays in front of whatever is running, so it can name a new cause while this
+        // screen is already visible: re-read its failure on a poll, and stop it again in onPause
+        handler.removeCallbacks(faultPoll)
+        faultPolling = true
+        handler.postDelayed(faultPoll, FAULT_POLL_MS)
+    }
+
+    override fun onPause() {
+        handler.removeCallbacks(faultPoll)
+        faultPolling = false
+        super.onPause()
+    }
+
+    // -------------------------------------------------------------------- failures
+
+    /**
+     * Repeats the failure the panel is showing, in the panel's own words, with the one fix this screen
+     * can carry out. The service owns the causes; this screen only renders [CaptureFault].
+     */
+    private fun showFault() {
+        if (faultBtn == null) return
+        val f = screenFault ?: CaptureService.lastFault
+        // onResume and the poll below both land here, so redraw only when the cause or detail changed
+        if (f == shownFault && (f == null || screenDetail == shownDetail)) return
+        shownFault = f
+        shownDetail = screenDetail
+        if (f == null) {
+            faultView?.visibility = View.GONE
+            faultBtn?.visibility = View.GONE
+            toastedFault = null
+            return
+        }
+        faultView?.text = f.panelText(screenDetail)
+        faultView?.visibility = View.VISIBLE
+        val button = faultBtn ?: return
+        when {
+            f == CaptureFault.OVERLAY_PERMISSION -> {
+                button.text = "Allow overlay"
+                button.visibility = View.VISIBLE
+                button.setOnClickListener { openOverlaySettings() }
+            }
+            f == CaptureFault.NEEDS_CONSENT -> {
+                button.text = "Allow screen capture"
+                button.visibility = View.VISIBLE
+                button.setOnClickListener { requestCaptureConsent() }
+            }
+            f.isCapture -> {
+                button.text = "Try capture again"
+                button.visibility = View.VISIBLE
+                button.setOnClickListener { requestCaptureConsent() }
+            }
+            else -> {
+                // board not found or unreadable: the panel's Retry is the one that clears it, because
+                // only the service can re-read the screen or learn the pieces.
+                button.visibility = View.GONE
+            }
+        }
+        if (toastedFault != f) {
+            toastedFault = f
+            Toast.makeText(this, f.sentence, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun openOverlaySettings() {
+        startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+    }
+
+    /**
+     * Asks for the screen-capture token. Without the overlay permission the system dialog's answer is
+     * useless, because the panel it feeds can never be drawn, so that cause is named instead.
+     */
+    private fun requestCaptureConsent() {
+        if (!Settings.canDrawOverlays(this)) {
+            screenFault = CaptureFault.OVERLAY_PERMISSION
+            screenDetail = ""
+            showFault()
+            openOverlaySettings()
+            return
+        }
+        val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        @Suppress("DEPRECATION")
+        startActivityForResult(mpm.createScreenCaptureIntent(), reqCapture)
     }
 
     // -------------------------------------------------------------------- Shizuku
@@ -358,21 +506,46 @@ class MainActivity : Activity() {
     @Suppress("DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == reqCapture && resultCode == RESULT_OK && data != null) {
+        if (requestCode != reqCapture) return
+        if (resultCode == RESULT_OK && data != null) {
+            screenFault = null
+            screenDetail = ""
             val i = Intent(this, CaptureService::class.java)
                 .putExtra("code", resultCode)
                 .putExtra("data", data)
             startForegroundService(i)
+            showFault()
             moveTaskToBack(true)
+            return
         }
+        // Cancelled, or the dialog handed nothing back: without a token the panel has no pixels to
+        // read, so name that cause here with a way to ask again rather than leaving the panel silent.
+        screenFault = CaptureFault.NEEDS_CONSENT
+        screenDetail = "You closed the capture dialog without allowing it."
+        showFault()
     }
 
     override fun onDestroy() {
+        handler.removeCallbacks(faultPoll)
+        faultPolling = false
         try {
             Shizuku.removeRequestPermissionResultListener(permissionListener)
         } catch (e: Throwable) {
         }
         engine?.stop()
         super.onDestroy()
+    }
+
+    companion object {
+        /**
+         * Extra the floating panel puts on the Intent that starts this screen when it needs a fresh
+         * capture consent. [CaptureService.requestConsent] sends it for a spent or revoked token, so
+         * [onCreate] and [onNewIntent] both read it, and [consumeReconsent] takes it back off, so one
+         * request raises one dialog even when the screen is recreated.
+         */
+        const val EXTRA_RECONSENT = "reconsent"
+
+        /** how often this screen re-reads [CaptureService.lastFault] while it is in front */
+        private const val FAULT_POLL_MS = 500L
     }
 }

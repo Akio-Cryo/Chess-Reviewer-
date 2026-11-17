@@ -109,4 +109,40 @@ object Levels {
     fun multiPvFor(elo: Int?): Int = MULTI_PV
 
     const val MULTI_PV = 5
+
+    // ------------------------------------------------------------ how one search is run
+
+    /** the shortest search worth asking for: `movetime 0` is the same to the engine as no limit */
+    const val MIN_MOVE_TIME_MS = 50
+
+    /** the longest search the panel will wait for, whatever a caller passes */
+    const val MAX_MOVE_TIME_MS = 30_000
+
+    /** depth ceiling sent with every search, so even a wedged clock cannot run one forever */
+    const val SEARCH_DEPTH_CAP = 24
+
+    /** how long past its own movetime a search may run before it is stopped and given up on */
+    const val SEARCH_GRACE_MS = 3_000
+
+    /** a caller's move time, brought into the range the engine and the panel can both live with */
+    fun thinkTimeMs(asked: Int): Int = asked.coerceIn(MIN_MOVE_TIME_MS, MAX_MOVE_TIME_MS)
+
+    /**
+     * The `go` line for one search.
+     *
+     * Every search carries a depth ceiling and a move time, and none is ever sent as a bare `go`.
+     * The engine's parse_limits only sets a limit when the line names one, so a `go` with no token,
+     * or with `movetime 0`, leaves every limit at zero and the search runs until something else
+     * stops it: that is how the panel can sit on "Thinking…" with no move and never come back.
+     * [nodes] is the node budget the Skill Level steps use; it is added only when positive, so a
+     * step at or above the rating floor runs on time alone.
+     */
+    fun goCommand(moveTimeMs: Int, nodes: Int): String {
+        val time = thinkTimeMs(moveTimeMs)
+        return if (nodes > 0) {
+            "go depth $SEARCH_DEPTH_CAP nodes $nodes movetime $time"
+        } else {
+            "go depth $SEARCH_DEPTH_CAP movetime $time"
+        }
+    }
 }
