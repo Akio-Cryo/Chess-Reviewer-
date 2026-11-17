@@ -17,6 +17,11 @@ import re
 import subprocess
 
 
+DEPTH_CAP = 24  # Levels.SEARCH_DEPTH_CAP: every `go` in the app carries it
+MATE_BASE = 50000   # EngineLine.score counts a mate as 100000 -/+ n*100, so a |score| above this is
+                    # a mate; real centipawn evaluations never come near it
+
+
 class Engine:
     def __init__(self, path, cfg):
         self.cfg = cfg
@@ -59,12 +64,12 @@ class Engine:
             self.option("Skill Level", cfg["skill"])
 
     def go_command(self, movetime):
+        # mirrors Levels.goCommand: every search carries the depth ceiling and the move time
         cfg = self.cfg
+        depth = "go depth %d" % DEPTH_CAP
         if cfg.get("nodes"):
-            return "go nodes %d movetime %d" % (cfg["nodes"], movetime)
-        if cfg.get("depth"):
-            return "go depth %d movetime %d" % (cfg["depth"], movetime)
-        return "go movetime %d" % movetime
+            return "%s nodes %d movetime %d" % (depth, cfg["nodes"], movetime)
+        return "%s movetime %d" % (depth, movetime)
 
     def play(self, position, movetime):
         """the move the app would show, and the lines it was drawn from"""
@@ -111,24 +116,40 @@ RNG = random.Random(20261115)
 
 def choose(ranked, best, budget, mistake, rng):
     """Humanizer.chooseMove, in Python"""
-    own = best if best else (ranked[0][0] if ranked else None)
-    if not ranked:
+    scored = [r for r in ranked if is_move(r[0])]
+    own = best if is_move(best) else (scored[0][0] if scored else best)
+    lines = scored if scored else ranked
+    if not lines:
         return own
-    top_move, top_score = ranked[0]
+    top_move, top_score = lines[0]
     if mistake < 1.0 and rng.random() >= mistake:
         return own
-    pool = [(m, s) for m, s in ranked if m != own and top_score - s <= budget]
+    if len(lines) < 2:
+        return own
+    # a mate score is not a centipawn evaluation: the app plays its own move rather than weigh
+    # alternatives against it (and exp() would overflow on the difference)
+    if abs(top_score) >= MATE_BASE:
+        return own
+    # only lines with a real centipawn score can be weighed: the app drops mate lines here too
+    pool = [(m, s) for m, s in lines if m != own and abs(s) < MATE_BASE and top_score - s <= budget]
     if not pool:
         return own
     temperature = max(budget / 4.0, 4.0)
     weights = [math.exp(-(top_score - s) / temperature) for _, s in pool]
     total = sum(weights)
+    if total <= 0.0:
+        return own
     roll = rng.random() * total
     for (m, _), w in zip(pool, weights):
         roll -= w
         if roll <= 0:
             return m
     return pool[-1][0]
+
+
+def is_move(move):
+    """Humanizer.isMove, in Python: `bestmove (none)` and an empty line are not moves"""
+    return bool(move) and len(move) >= 4 and "a" <= move[0] <= "h"
 
 
 RNG = random.Random(20261115)
