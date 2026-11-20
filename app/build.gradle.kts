@@ -11,41 +11,8 @@ android {
         applicationId = "com.example.chessreviewer"
         minSdk = 26
         targetSdk = 34
-        // Goes up with every GitHub build so new releases install over old ones.
-        versionCode = 100 + (System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull() ?: 0)
-        versionName = "1.3"
-    }
-
-    // Release signing: the workflow supplies these from GitHub secrets.
-    signingConfigs {
-        create("release") {
-            val keystorePath = System.getenv("KEYSTORE_PATH")
-            if (keystorePath != null) {
-                storeFile = file(keystorePath)
-                storePassword = System.getenv("KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("KEY_ALIAS")
-                keyPassword = System.getenv("KEY_PASSWORD")
-            }
-        }
-    }
-
-    buildTypes {
-        release {
-            signingConfig = signingConfigs.getByName("release")
-            isMinifyEnabled = false
-        }
-    }
-
-    // Only used if your folder is still misspelled "scr" instead of "src".
-    if (file("scr/main/AndroidManifest.xml").exists()) {
-        sourceSets {
-            getByName("main") {
-                manifest.srcFile("scr/main/AndroidManifest.xml")
-                java.srcDirs("scr/main/java")
-                aidl.srcDirs("scr/main/aidl")
-                res.srcDirs("scr/main/res")
-            }
-        }
+        versionCode = 5
+        versionName = "1.4"
     }
 
     buildFeatures {
