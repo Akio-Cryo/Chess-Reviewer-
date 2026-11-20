@@ -59,6 +59,12 @@ class CaptureService : Service() {
     private var screenH = 0
     private var started = false
 
+    // reads screens that FLAG_SECURE turns black for the ordinary capture path
+    private lateinit var secure: SecureCapture
+    private var secureMode = false
+    private var lastSecureTry = 0L
+    private val SECURE_POLL_MS = 500L
+
     // settings shared between the UI thread and the analysis loop
     @Volatile private var boardRect: IntArray? = null   // left, top, size (screen pixels)
     @Volatile private var templates: Templates? = null
@@ -68,6 +74,11 @@ class CaptureService : Service() {
     @Volatile private var turnFlipRequested = false
     @Volatile private var saveRequested = false
     @Volatile private var freshAfter = 0L
+
+    // Stockfish strength presets the Elo button cycles through (null = full strength);
+    // the low steps sit under UCI_Elo's floor and are played through Skill Level instead
+    private val eloSteps = listOf<Int?>(null, 2500, 2000, 1600, 1320, 1100, 900, 700)
+    private var eloIdx = 0
 
     // used only by the analysis loop
     private var lastFrame: Bitmap? = null
@@ -91,13 +102,16 @@ class CaptureService : Service() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         prefs = getSharedPreferences("chess", MODE_PRIVATE)
         engine = StockfishEngine(this)
-        engine.setStrength(prefs.getInt("elo", 0))
+        secure = SecureCapture(this, cacheDir)
         whiteAtBottom = prefs.getBoolean("whiteBottom", true)
         prefs.getString("tpl", null)?.let { templates = Templates.parse(it) }
         prefs.getString("rect", null)?.let { s ->
             val p = s.split(",").mapNotNull { it.toIntOrNull() }
             if (p.size == 3) boardRect = intArrayOf(p[0], p[1], p[2])
         }
+        // resume the strength the user last picked; the engine applies it on its first start
+        eloIdx = eloSteps.indexOfFirst { it == EngineSettings.elo(this) }.coerceAtLeast(0)
+        engine.setElo(EngineSettings.elo(this))
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -205,6 +219,19 @@ class CaptureService : Service() {
 
     /** debug: write what the app sees to Pictures/ChessReviewer so the user can share it */
     private fun saveFrame(frame: Bitmap) {
+        // On a protected screen the captured frame is black; save the root view instead so the
+        // picture is actually useful.
+        var src = frame
+        var borrowed = false
+        if (looksBlocked(src)) {
+            val shot = secure.grab(screenW, screenH)
+            if (shot != null && !looksBlocked(shot)) {
+                src = shot
+                borrowed = true
+            } else {
+                shot?.recycle()
+            }
+        }
         try {
             val v = ContentValues()
             v.put(MediaStore.Images.Media.DISPLAY_NAME, "chess_debug_" + System.currentTimeMillis() + ".png")
@@ -212,13 +239,16 @@ class CaptureService : Service() {
             if (Build.VERSION.SDK_INT >= 29) v.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ChessReviewer")
             val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)
             if (uri == null) { setStatus("Couldn't save the picture."); return }
-            val w = minOf(screenW, frame.width)
-            val h = minOf(screenH, frame.height)
-            val crop = Bitmap.createBitmap(frame, 0, 0, w, h)
+            val w = minOf(screenW, src.width)
+            val h = minOf(screenH, src.height)
+            val crop = Bitmap.createBitmap(src, 0, 0, w, h)
             contentResolver.openOutputStream(uri)?.use { out -> crop.compress(Bitmap.CompressFormat.PNG, 100, out) }
+            crop.recycle()
             setStatus("Saved a picture of what I see to Pictures/ChessReviewer (open Photos / Gallery). Send it to me.")
         } catch (e: Exception) {
             setStatus("Couldn't save the picture: " + e.message)
+        } finally {
+            if (borrowed) src.recycle()
         }
     }
 
@@ -243,6 +273,102 @@ class CaptureService : Service() {
         return n > 0 && dark * 100 / n >= 85
     }
 
+    /** one bitmap to analyse, and whether it is new pixels */
+    private class Frame(val bitmap: Bitmap, val fresh: Boolean)
+
+    /** whatever MediaProjection last handed us, as a bitmap, or null when nothing arrived */
+    private fun takeProjectionFrame(): Bitmap? {
+        val img = try { reader?.acquireLatestImage() } catch (e: Exception) { null } ?: return null
+        try {
+            val plane = img.planes[0]
+            val rowPadding = plane.rowStride - plane.pixelStride * img.width
+            val bmp = Bitmap.createBitmap(
+                img.width + rowPadding / plane.pixelStride, img.height, Bitmap.Config.ARGB_8888
+            )
+            bmp.copyPixelsFromBuffer(plane.buffer)
+            return bmp
+        } catch (e: Exception) {
+            return null
+        } finally {
+            try { img.close() } catch (e: Exception) { }
+        }
+    }
+
+    /**
+     * Picks the pixels to analyse.
+     *
+     * MediaProjection returns solid black for a window that sets FLAG_SECURE, so a black
+     * frame is thrown away and the same screen is re-read through root `screencap`, or through
+     * Shizuku when the phone is not rooted. If the screen becomes capturable again the normal
+     * path takes over on the next frame.
+     */
+    private fun resolveFrame(): Frame? {
+        val proj = takeProjectionFrame()
+        if (proj != null) {
+            if (!looksBlocked(proj)) {
+                if (secureMode) {
+                    secureMode = false
+                    setStatus("Screen capture is working again.")
+                }
+                return Frame(proj, true)
+            }
+            proj.recycle()
+            if (secureMode && SystemClock.uptimeMillis() - lastSecureTry < SECURE_POLL_MS) {
+                // between root reads: keep showing the last readable frame instead of flickering
+                lastFrame?.let { return Frame(it, false) }
+            }
+            if (secure.mode == SecureCapture.Mode.UNKNOWN) {
+                setStatus("This screen blocks capture. Checking root, then Shizuku, so I can read it anyway…")
+            }
+            val shot = secureShot()
+            if (shot != null) {
+                secureMode = true
+                return Frame(shot, true)
+            }
+            secureMode = false
+            blockedHint()
+            return null
+        }
+        if (secureMode) {
+            val shot = secureShot()
+            if (shot != null) return Frame(shot, true)
+        }
+        lastFrame?.let { return Frame(it, false) }
+        return null
+    }
+
+    /** Root or Shizuku screenshot of the display, throttled to one per SECURE_POLL_MS. */
+    private fun secureShot(): Bitmap? {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastSecureTry < SECURE_POLL_MS) return null
+        lastSecureTry = now
+        val shot = secure.grab(screenW, screenH)
+        if (shot == null || looksBlocked(shot)) {
+            shot?.recycle()
+            return null
+        }
+        return shot
+    }
+
+    private fun blockedHint() {
+        val detail = secure.lastError.take(90)
+        setStatus(
+            when (secure.mode) {
+                SecureCapture.Mode.ROOT ->
+                    "This screen blocks capture and even root saw only black (DRM video does that). Open a screen that allows capture, or type the position into the app."
+                SecureCapture.Mode.SHIZUKU ->
+                    "This screen blocks capture and even Shizuku saw only black (DRM video does that). Open a screen that allows capture, or type the position into the app."
+                SecureCapture.Mode.NONE ->
+                    "This screen blocks screen capture (FLAG_SECURE) and neither root nor Shizuku could read it" +
+                        (if (detail.isBlank()) "" else " (" + detail + ")") +
+                        ". Start Shizuku, grant this app access, and reopen Chess Reviewer so it can reach Shizuku; " +
+                        "or type the position into the Chess Reviewer app instead."
+                else ->
+                    "This screen blocks capture. Looking for root, then Shizuku, so I can read it anyway…"
+            }
+        )
+    }
+
     private fun tick() {
         if (resetRequested) {
             resetRequested = false
@@ -252,39 +378,21 @@ class CaptureService : Service() {
             reprocess = true
         }
 
-        var newFrame = false
-        val img = try { reader?.acquireLatestImage() } catch (e: Exception) { null }
-        if (img != null) {
-            try {
-                val plane = img.planes[0]
-                val rowPadding = plane.rowStride - plane.pixelStride * img.width
-                val bmp = Bitmap.createBitmap(
-                    img.width + rowPadding / plane.pixelStride, img.height, Bitmap.Config.ARGB_8888
-                )
-                bmp.copyPixelsFromBuffer(plane.buffer)
-                lastFrame?.recycle()
-                lastFrame = bmp
-                newFrame = true
-                if (SystemClock.uptimeMillis() > freshAfter) frameFresh = true
-            } catch (e: Exception) {
-            } finally {
-                img.close()
-            }
+        val picked = resolveFrame() ?: return
+        if (picked.bitmap !== lastFrame) {
+            lastFrame?.recycle()
+            lastFrame = picked.bitmap
         }
-
-        val frame = lastFrame ?: return
         if (SystemClock.uptimeMillis() <= freshAfter) { frameFresh = false; return }
+        if (picked.fresh) frameFresh = true
         if (!frameFresh) return
+
+        val frame = picked.bitmap
+        val newFrame = picked.fresh
 
         if (saveRequested) {
             saveRequested = false
             saveFrame(frame)
-            return
-        }
-
-        if (newFrame && looksBlocked(frame)) {
-            learnRequested = false
-            setStatus("This screen blocks screen capture (I only see black), so I can't read the board here. You can type the position into the Chess Reviewer app instead, or use a screen that allows capture.")
             return
         }
 
@@ -411,6 +519,16 @@ class CaptureService : Service() {
         }
     }
 
+    /** Cycle Stockfish between full strength and a few friendlier Elo targets. */
+    private fun cycleElo() {
+        eloIdx = (eloIdx + 1) % eloSteps.size
+        val v = eloSteps[eloIdx]
+        // off the UI thread: setElo shares the engine's lock with a running analysis
+        Thread { engine.setElo(v) }.start()
+        setStatus("Stockfish strength: " + EngineSettings.label(v) + ". Tap Elo again to change it.")
+        if (stablePos != null) runEngine()
+    }
+
     private fun runEngine() {
         val pos = stablePos ?: return
         if (!engine.available()) {
@@ -454,7 +572,7 @@ class CaptureService : Service() {
             val v = (if (black) -cp else cp) / 100.0
             String.format(Locale.US, "%+.2f", v)
         } else "?"
-        return "$side to move\nSuggested: $move  ($b)\nEval (White): $ev"
+        return "$side to move\nBest: $move  ($b)\nEval (White): $ev"
     }
 
     // ------------------------------------------------------------------ overlay UI
@@ -516,7 +634,7 @@ class CaptureService : Service() {
         fun addButton(label: String, action: () -> Unit) {
             val b = Button(this)
             b.text = label
-            b.textSize = 10f
+            b.textSize = 11f
             b.isAllCaps = false
             b.setPadding(2, 0, 2, 0)
             b.setOnClickListener { action() }
@@ -530,10 +648,14 @@ class CaptureService : Service() {
             setStatus("Board flipped: White is now at the " + (if (whiteAtBottom) "bottom." else "top."))
         }
         addButton("Turn") { turnFlipRequested = true }
-        addButton("Level") { cycleLevel() }
+        addButton("Elo") { cycleElo() }
         addButton("Save") { saveRequested = true; setStatus("Saving a picture…") }
         addButton("Stop") { stopSelf() }
         root.addView(row)
+
+        if (EngineSettings.elo(this) != null) {
+            setStatus("Stockfish strength: " + EngineSettings.label(EngineSettings.elo(this)))
+        }
 
         val w = (screenW * 0.94f).toInt()
         val lp = overlayParams(w, WindowManager.LayoutParams.WRAP_CONTENT)
@@ -546,13 +668,6 @@ class CaptureService : Service() {
         if (templates != null) {
             setStatus("Piece set already learned. Open a game and play; the board is found automatically.")
         }
-    }
-
-    private fun cycleLevel() {
-        val next = Levels.next(prefs.getInt("elo", 0))
-        prefs.edit().putInt("elo", next).apply()
-        engine.setStrength(next)
-        setStatus("Engine strength: " + Levels.label(next) + ". It applies from the next position.")
     }
 
     private fun toggleFrame() {
